@@ -4,13 +4,14 @@
 #define RX_PIN 0 // Arduino's hardware RX pin
 #define ONEWIRE_PIN 2
 
+//Constants for DS2408B - taken from owfs ow_ds9097U.c.
+
 // Mode Commands
 #define MODE_DATA 0xE1
 #define MODE_COMMAND 0xE3
 #define MODE_STOP_PULSE 0xF1
 
 // Masks for all bit ranges
-#define CMD_MASK 0x80
 #define FUNCTSEL_MASK 0x60
 #define BITPOL_MASK 0x10
 #define SPEEDSEL_MASK 0x0C
@@ -21,9 +22,7 @@
 
 // Command or config bit
 #define CMD_COMM 0x81
-#define CMD_COMM_RESPONSE 0x80
 #define CMD_CONFIG 0x01
-#define CMD_CONFIG_RESPONSE 0x00
 
 // Function select bits
 #define FUNCTSEL_BIT 0x00
@@ -242,7 +241,7 @@ void handle_command_mode(BYTE byteIn)
 
 void handle_check_mode(BYTE byteIn)
 {
-  if (byteIn == 0xe3)
+  if (byteIn == MODE_COMMAND)
   {
     if (isSearchOn)
     {
@@ -272,7 +271,8 @@ void doSearch(BYTE byteIn)
 {
   // TODO: this won't work properly if the search bytes include e3h. Since the 1 bit should always be 0 this should be OK.
   BYTE searchIn[16];
-  BYTE searchOut[16] = {0}; // Initialize output array to zero
+  
+  //Read in 16 bytes of search bits
   searchIn[0] = byteIn;
   int i = 1;
   while (i < 16)
@@ -287,11 +287,12 @@ void doSearch(BYTE byteIn)
     DEBUGF("0x%02X", searchIn[j]);
   }
 
+  //Reset bus and send search command
   onewire_reset(ONEWIRE_PIN);
   onewire_send_byte(ONEWIRE_PIN, 0xF0);
 
-  // onewire_send_byte(0xf0); //rom search
-  //  Process the search command
+
+  BYTE searchOut[16] = {0};
   for (int i = 0; i < 16; i++)
   {
     for (int j = 0; j < 8; j += 2)
@@ -303,7 +304,7 @@ void doSearch(BYTE byteIn)
       boolean d;
       if (b0 == b1)
       {
-        // conflict:
+        // discrepancy
         d = 1;
         b2 = rn;
       }
@@ -318,6 +319,7 @@ void doSearch(BYTE byteIn)
       searchOut[i] |= ret << j;
     }
   }
+
   DEBUGF("Search outputs");
   for (int j = 0; j < i; j++)
   {
@@ -328,7 +330,7 @@ void doSearch(BYTE byteIn)
 void handle_data_mode(BYTE byteIn)
 {
   DEBUGF("Handling data mode with byte: 0x%02X", byteIn);
-  if (byteIn == 0xe3)
+  if (byteIn == MODE_COMMAND)
   {
     currentMode = CHECK;
     return;
