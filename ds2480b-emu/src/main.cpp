@@ -68,14 +68,50 @@
 #define PARMSET_REVERSE_POLARITY 0x08
 
 #define BYTE uint8_t
+//#define DEBUG 1
+#ifdef DEBUG
+char debugBuffer[128]; // Buffer for debug messages
+#define DEBUGF(fmt, ...) \
+  snprintf(debugBuffer, sizeof(debugBuffer), "%s:%d: " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
+  Serial.println(debugBuffer);
+#else
+#define DEBUGF(fmt, ...) \
+  do {} while (0) // No-op if DEBUG is not defined
+#endif
+
+void waitForBreak();
+void doSearch(BYTE byteIn);
+void sendByte(BYTE byteIn);
 
 BYTE speedsel_config = SPEEDSEL_STD; // Default speed selection
-int baudRate = 9600;                 // Default baud rate
+unsigned int baudRate = 9600;                 // Default baud rate
+
+
+#define PDSRC_BITS 0b001
+#define PPD_BITS   0b010
+#define SPUD_BITS  0b011
+#define W1LT_BITS  0b100
+#define DS0_BITS   0b101
+#define LOAD_BITS  0b110
+#define RBR_BITS   0b111
+
+byte config[8] = {
+  0,
+  0, //PPD
+  0b100, //SPUD
+  0b100, //W1LT
+  0, //DS0
+  0, //LOAD
+  0, //RBR
+};
+
+//config bits:
 
 enum mode
 {
   COMMAND,
   DATA,
+  CHECK,
 };
 
 boolean isSearchOn = false;
@@ -91,19 +127,20 @@ bool onewire_send_bit(bool bitValue)
   bool value = 0;
   if (bitValue)
   {
-    delayMicroseconds(8); // Simulate the time it takes to write a bit
+    delayMicroseconds(7); // Simulate the time it takes to write a bit
     pinMode(ONEWIRE_PIN, INPUT);
-    delayMicroseconds(3); // Wait for the slave to respond
+    delayMicroseconds(4); // Wait for the slave to respond
     value = digitalRead(ONEWIRE_PIN);
     delayMicroseconds(49); // Wait for the slave to respond
   }
   else
   {
-    delayMicroseconds(57);
+    delayMicroseconds(61);
     pinMode(ONEWIRE_PIN, INPUT); // Set the pin to input to read the bus
     delayMicroseconds(3);        // Wait for the slave to respond
     value = 0;
   }
+  delayMicroseconds(2); // Wait for the bus to stabilize
   return value; // Return the read value
 }
 
@@ -130,40 +167,23 @@ BYTE onewire_send_byte(BYTE byteIn)
   return response; // Return the read byte
 }
 
-void handle_config(byte byteIn)
+void handle_config(BYTE byteIn)
 {
-  BYTE parameter = (byteIn & PARMSEL_MASK) >> 1 + 3;
+  BYTE parameter = (byteIn & PARMSEL_MASK) >> (1 + 3);
   BYTE value = (byteIn & PARMSET_MASK) >> 1;
 
   if (parameter == PARMSEL_PARMREAD)
   {
-    byte response = 0; // response is 3 bits, we'll shift out later
-    if (parameter == PARM_BAUDRATE)
-    {
-      if (baudRate == 9600)
-      {
-        response = PARMSET_9600;
-      }
-      else if (baudRate == 19200)
-      {
-        response = PARMSET_19200;
-      }
-      else if (baudRate == 57600)
-      {
-        response = PARMSET_57600;
-      }
-      else if (baudRate == 115200)
-      {
-        response = PARMSET_115200;
-      }
-      response >>= 1;
-    }
+    
+    BYTE response = config[value];
+    DEBUGF("Reading parameter: 0x%02X: %02x", value, response);
     // TODO: read back other params here
     Serial.write((0b01110000 & byteIn) | response << 1);
     return;
   }
   else
   {
+    config[parameter] = value <<1; // Store the baud rate setting
     if (parameter == PARM_BAUDRATE)
     {
       // baud:
@@ -183,6 +203,7 @@ void handle_config(byte byteIn)
         baudRate = 115200;
         break;
       }
+      DEBUGF("Changing baud rate to: %d (%dbd)", value << 1, baudRate);
       Serial.end();           // End the current serial connection
       Serial.begin(baudRate); // Reinitialize serial with the new baud rate
       while (!Serial)
@@ -193,50 +214,76 @@ void handle_config(byte byteIn)
   return;
 }
 
-void handle_command_mode(byte byteIn)
-{
-  if (byteIn == 0xE1)
-  {
-    // handle mode shift
-    currentMode = DATA;
-  }
-
-  currentMode = COMMAND;
-
-  if (byteIn & CMD_MODE_OP_MASK == CMD_CONFIG)
-  {
-    handle_config(byteIn);
-    return;
-  }
-
-  if (byteIn & CMD_MODE_OP_MASK != CMD_MODE_OP_MASK)
-  {
-    // This is an invalid command
-    return;
-  }
-
-  byte func = byteIn & FUNCTSEL_MASK;
-
-  switch (func)
-  {
-  case FUNCTSEL_BIT:
-    // get bit value:
-    byte bitValue = (byteIn & BITPOL_MASK) == BITPOL_ONE;
-    speedsel_config = byteIn & SPEEDSEL_MASK;
-    break;
-
-  // Speed selection (ignored for now)
-  case FUNCTSEL_RESET:
-    speedsel_config = byteIn & SPEEDSEL_MASK;
-    // Reset the bus:
+bool onewire_reset(){
     pinMode(ONEWIRE_PIN, OUTPUT);
     digitalWrite(ONEWIRE_PIN, LOW); // Pull the bus low
     delayMicroseconds(480);         // Hold low for 480us
     pinMode(ONEWIRE_PIN, INPUT);    // Release the bus
-    Serial.write(0b11100001);
-    break;
-  case FUNCTSEL_SEARCHOFF:
-    if (byteIn & FUNCTSEL_SEARCHON == FUNCTSEL_SEARCHON)
+
+    byte noShort = digitalRead(ONEWIRE_PIN); // Read the bus state
+    delayMicroseconds(70);
+    byte noPresence = digitalRead(ONEWIRE_PIN); // Read the presence pulse
+    delayMicroseconds(410);
+    DEBUGF("Presence pulse: %d, No short: %d", noPresence, noShort);
+    return !noPresence;
+}
+
+void handle_command_mode(BYTE byteIn)
+{
+  DEBUGF("Handling command mode with byte: 0x%02X", byteIn);
+  if (byteIn == 0xE1)
+  {
+    DEBUGF("Switching to DATA mode");
+    // handle mode shift
+    currentMode = DATA;
+    return;
+  }
+
+  currentMode = COMMAND;
+
+  if ((byteIn & CMD_MODE_OP_MASK) == CMD_CONFIG)
+  {
+    DEBUGF("Handling configuration command: 0x%02X", byteIn);
+    handle_config(byteIn);
+    return;
+  }
+  
+  if ((byteIn & CMD_MODE_OP_MASK) != CMD_MODE_OP_MASK)
+  {
+    DEBUGF("Invalid command in COMMAND mode: 0x%02X", byteIn);
+    // This is an invalid command
+    return;
+  }
+
+  BYTE func = byteIn & FUNCTSEL_MASK;
+  DEBUGF("Function select: 0x%02X", func);
+
+  if(func == FUNCTSEL_BIT){
+    DEBUGF("Handling bit function with byte: 0x%02X", byteIn);
+    // get bit value:
+    BYTE bitValue = (byteIn & BITPOL_MASK) == BITPOL_ONE;
+    speedsel_config = byteIn & SPEEDSEL_MASK;
+
+    BYTE result = onewire_send_bit(bitValue);
+    BYTE responseByte = 0b10000000 | (byteIn & 0b11100) | (result ? 0b00000011 : 0b00000000);
+
+    DEBUGF("Sending bit: %d with speed: 0x%02X; result %d response %02x", bitValue, speedsel_config, result, responseByte);
+    Serial.write(responseByte);
+   }else if( func == FUNCTSEL_RESET){
+    DEBUGF("Reset command received: 0x%02X", byteIn);
+    speedsel_config = byteIn & SPEEDSEL_MASK;
+    // Reset the bus:
+
+    bool presence = onewire_reset();
+    if(presence){
+      Serial.write(0b11001100);
+    }else{
+      Serial.write(0b11001101);
+    }
+    DEBUGF("Reset command processed. Presence pulse: %d", presence);
+   }else if(func == FUNCTSEL_SEARCHOFF){
+    DEBUGF("Search mode change");
+    if ((byteIn & FUNCTSEL_SEARCHON) == FUNCTSEL_SEARCHON)
     {
       isSearchOn = true;
     }
@@ -244,11 +291,12 @@ void handle_command_mode(byte byteIn)
     {
       isSearchOn = false;
     }
+    DEBUGF("Search mode is now %s", isSearchOn ? "ON" : "OFF");
     speedsel_config = byteIn & SPEEDSEL_MASK;
-    break;
-  case FUNCTSEL_CHMOD:
+   }else if(func == FUNCTSEL_CHMOD){
+    DEBUGF("Changing to command mode with speed: 0x%02X", byteIn & SPEEDSEL_MASK);
     // pulse is not implemented
-    if (byteIn & PRIME5V_TRUE == PRIME5V_TRUE)
+    if ((byteIn & PRIME5V_TRUE) == PRIME5V_TRUE)
     {
       dataModePullupAfterEveryByte = true;
     }
@@ -257,48 +305,183 @@ void handle_command_mode(byte byteIn)
       dataModePullupAfterEveryByte = false;
     }
     Serial.write(byteIn);
-    break;
+    DEBUGF("Changed to command mode with pull-up: %s", dataModePullupAfterEveryByte ? "ON" : "OFF");
+  }else {
+    DEBUGF("Unknown function select: 0x%02X", func);
   }
+  DEBUGF("Completed handling command mode with byte: 0x%02X", byteIn);
 }
 
-void handle_data_mode(BYTE byteIn)
+void handle_check_mode(BYTE byteIn)
 {
 
-  if (isSearchOn)
+  if (byteIn == 0xe3)
   {
-    BYTE searchIn[16];
-    searchIn[0] = byteIn;
-    int i = 1;
-    while (Serial.available() && i < 16)
-    {
-      searchIn[i++] = Serial.read();
-    }
+      if(isSearchOn){
+        doSearch(byteIn);
+      }else{
+        sendByte(byteIn);
+      }
+    currentMode = DATA;
   }
   else
   {
-    onewire_send_byte(byteIn);
+    // Return a dummy response for other commands
+    currentMode = COMMAND;
+    handle_command_mode(byteIn);
+  }
+}
+
+
+void sendByte(BYTE byteIn){
+  DEBUGF("Sending byte in DATA mode: 0x%02X", byteIn);  
+      BYTE res = onewire_send_byte(byteIn);
+      DEBUGF("Received byte: 0x%02X", res);
+      Serial.write(res); // Echo the response back
+}
+void doSearch(BYTE byteIn){
+  BYTE searchIn[16];
+    BYTE searchOut[16] = {0}; // Initialize output array to zero
+    searchIn[0] = byteIn;
+    int i = 1;
+    while (i < 16)
+    {
+      while(!Serial.available())
+        ;
+      searchIn[i++] = Serial.read();
+    }
+    DEBUGF("Search inputs:");
+    for (int j = 0; j < i; j++)
+    {
+      DEBUGF("0x%02X", searchIn[j]);
+    }
+
+    onewire_reset();
+
+    onewire_send_byte(0xF0);
+
+    //onewire_send_byte(0xf0); //rom search
+    // Process the search command
+    for(int i = 0; i < 16; i++){
+      for(int j = 0; j < 8; j+=2){
+        boolean b0 = onewire_send_bit(1);
+        boolean b1 = onewire_send_bit(1);
+        boolean rn = (searchIn[i] >> (j+1)) & 0x1;
+        boolean b2;
+        boolean d;
+        if(b0 == b1){
+          //conflict:
+          d=1;
+          b2 = rn;
+        }else{
+          d=0;
+          b2 = b0;
+        }
+        onewire_send_bit(b2);
+
+        BYTE ret = d | (b2 << 1);
+        searchOut[i] |= ret << j;
+      }
+    }
+    DEBUGF("Search outputs");
+    for (int j = 0; j < i; j++)
+    {
+      DEBUGF("0x%02X", searchOut[j]);
+      Serial.write(searchOut[j]);
+    }
+}
+void handle_data_mode(BYTE byteIn)
+{
+  DEBUGF("Handling data mode with byte: 0x%02X", byteIn);
+  if(byteIn == 0xe3){
+      currentMode = CHECK;
+      return;
+  }
+
+  if (isSearchOn)
+  {
+    doSearch(byteIn);
+  }
+  else
+  { 
+      sendByte(byteIn);
   }
 }
 
 void setup()
 {
 
-  pinMode(RX_PIN, INPUT);
-  byte byteIn;
+  //pinMode(RX_PIN, INPUT);
+  
 
+  #ifndef DEBUG
   // Wait for a break condition: line LOW for >12ms
-  waitForBreak();
+  //waitForBreak();
+  #endif
 
   // Start serial after detecting break
   Serial.begin(9600);
-  while (!Serial)
-    ;
+  while (!Serial); 
+  DEBUGF("Serial started at 9600 baud");
+  while(!Serial.available());
 
-  while (true)
+
+}
+
+void debugLoop(){
+   
+  onewire_reset();
+  onewire_send_byte(0x33);
+  BYTE romInfo[8];
+  for(int i = 0; i < 8; i++){
+    romInfo[i] = onewire_send_byte(0xff);
+  }
+  DEBUGF("ROM Info:");
+  DEBUGF("Family Code: 0x%02X", romInfo[0]);
+  DEBUGF("Serial Number: 0x%02X%02X%02X%02X%02X%02X", romInfo[1], romInfo[2], romInfo[3], romInfo[4], romInfo[5], romInfo[6]);
+  DEBUGF("CRC: 0x%02X", romInfo[7]);
+
+  onewire_send_byte(0x44);
+  while(true){
+  delay(100);
+  bool done = onewire_send_bit(1);
+  if(done){
+    break;
+  }
+  }
+
+  onewire_reset();
+  onewire_send_byte(0x33);
+  for(int i = 0; i < 8; i++){
+    romInfo[i] = onewire_send_byte(0xff);
+  }
+  onewire_send_byte(0xbe);
+  
+  BYTE result[8];
+  for(int i = 0; i < 8; i++){
+    result[i] = onewire_send_byte(0xff);
+  }
+  DEBUGF("Temperature: %d.%d C", result[0], result[1]);
+
+
+  return;
+}
+void loop()
+{
+
+  DEBUGF("Starting main loop");
+  #ifdef DEBUG
+  //debugLoop();
+  //return;
+  #endif
+ 
+ while (true)
   {
     while (!Serial.available())
       ;
+    byte byteIn;
     byteIn = Serial.read();
+    DEBUGF("Received byte: 0x%02X. Current mode is %d", byteIn, currentMode);
     switch (currentMode)
     {
     case COMMAND:
@@ -307,13 +490,11 @@ void setup()
     case DATA:
       handle_data_mode(byteIn);
       break;
+    case CHECK:
+      handle_check_mode(byteIn);
+      break;
     }
   }
-}
-
-void loop()
-{
-  // You could add further DS2480B emulation here
 }
 
 void waitForBreak()
