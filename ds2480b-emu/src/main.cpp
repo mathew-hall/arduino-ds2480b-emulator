@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "onewire.h"
 
 #define RX_PIN 0 // Arduino's hardware RX pin
 #define ONEWIRE_PIN 2
@@ -45,13 +46,6 @@
 
 // Parameter select bits
 #define PARMSEL_PARMREAD 0x00
-#define PARMSEL_SLEW 0x10
-#define PARMSEL_12VPULSE 0x20
-#define PARMSEL_5VPULSE 0x30
-#define PARMSEL_WRITE1LOW 0x40
-#define PARMSEL_SAMPLEOFFSET 0x50
-#define PARMSEL_ACTIVEPULLUPTIME 0x60
-#define PARMSEL_BAUDRATE 0x70
 
 // 5V Follow Pulse select bits (If 5V pulse
 // will be following the next byte or bit.)
@@ -67,24 +61,12 @@
 #define PARMSET_115200 0x06
 #define PARMSET_REVERSE_POLARITY 0x08
 
-#define BYTE uint8_t
-//#define DEBUG 1
-#ifdef DEBUG
-char debugBuffer[128]; // Buffer for debug messages
-#define DEBUGF(fmt, ...) \
-  snprintf(debugBuffer, sizeof(debugBuffer), "%s:%d: " fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
-  Serial.println(debugBuffer);
-#else
-#define DEBUGF(fmt, ...) \
-  do {} while (0) // No-op if DEBUG is not defined
-#endif
 
-void waitForBreak();
 void doSearch(BYTE byteIn);
 void sendByte(BYTE byteIn);
 
-BYTE speedsel_config = SPEEDSEL_STD; // Default speed selection
-unsigned int baudRate = 9600;                 // Default baud rate
+BYTE speedsel_config = SPEEDSEL_STD;
+unsigned long baudRate = 9600;
 
 
 #define PDSRC_BITS 0b001
@@ -105,8 +87,6 @@ byte config[8] = {
   0, //RBR
 };
 
-//config bits:
-
 enum mode
 {
   COMMAND,
@@ -118,54 +98,6 @@ boolean isSearchOn = false;
 boolean dataModePullupAfterEveryByte = false;
 
 enum mode currentMode = COMMAND;
-
-bool onewire_send_bit(bool bitValue)
-{
-  // Write a bit to the bus then read. If we write a 1 there is time for the slave to change the line.
-  pinMode(ONEWIRE_PIN, OUTPUT);
-  digitalWrite(ONEWIRE_PIN, 0);
-  bool value = 0;
-  if (bitValue)
-  {
-    delayMicroseconds(7); // Simulate the time it takes to write a bit
-    pinMode(ONEWIRE_PIN, INPUT);
-    delayMicroseconds(4); // Wait for the slave to respond
-    value = digitalRead(ONEWIRE_PIN);
-    delayMicroseconds(49); // Wait for the slave to respond
-  }
-  else
-  {
-    delayMicroseconds(61);
-    pinMode(ONEWIRE_PIN, INPUT); // Set the pin to input to read the bus
-    delayMicroseconds(3);        // Wait for the slave to respond
-    value = 0;
-  }
-  delayMicroseconds(2); // Wait for the bus to stabilize
-  return value; // Return the read value
-}
-
-BYTE onewire_send_byte(BYTE byteIn)
-{
-  BYTE response = 0;
-  for (int i = 0; i < 8; i++)
-  {
-    bool bitValue = (byteIn & (1 << i)) != 0;    // Extract the bit
-    bool readValue = onewire_send_bit(bitValue); // Send the bit and read the response
-    if (readValue)
-    {
-      response |= (1 << i); // Set the corresponding bit in the response
-    }
-    if (dataModePullupAfterEveryByte)
-    {
-      pinMode(ONEWIRE_PIN, OUTPUT);
-      digitalWrite(ONEWIRE_PIN, HIGH); // Pull up after every byte
-      delayMicroseconds(60);           // Wait for the pull-up to take effect
-      pinMode(ONEWIRE_PIN, INPUT);     // Set the pin to input to read the bus
-    }
-  }
-
-  return response; // Return the read byte
-}
 
 void handle_config(BYTE byteIn)
 {
@@ -214,20 +146,6 @@ void handle_config(BYTE byteIn)
   return;
 }
 
-bool onewire_reset(){
-    pinMode(ONEWIRE_PIN, OUTPUT);
-    digitalWrite(ONEWIRE_PIN, LOW); // Pull the bus low
-    delayMicroseconds(480);         // Hold low for 480us
-    pinMode(ONEWIRE_PIN, INPUT);    // Release the bus
-
-    byte noShort = digitalRead(ONEWIRE_PIN); // Read the bus state
-    delayMicroseconds(70);
-    byte noPresence = digitalRead(ONEWIRE_PIN); // Read the presence pulse
-    delayMicroseconds(410);
-    DEBUGF("Presence pulse: %d, No short: %d", noPresence, noShort);
-    return !noPresence;
-}
-
 void handle_command_mode(BYTE byteIn)
 {
   DEBUGF("Handling command mode with byte: 0x%02X", byteIn);
@@ -264,7 +182,7 @@ void handle_command_mode(BYTE byteIn)
     BYTE bitValue = (byteIn & BITPOL_MASK) == BITPOL_ONE;
     speedsel_config = byteIn & SPEEDSEL_MASK;
 
-    BYTE result = onewire_send_bit(bitValue);
+    BYTE result = onewire_send_bit(ONEWIRE_PIN, bitValue);
     BYTE responseByte = 0b10000000 | (byteIn & 0b11100) | (result ? 0b00000011 : 0b00000000);
 
     DEBUGF("Sending bit: %d with speed: 0x%02X; result %d response %02x", bitValue, speedsel_config, result, responseByte);
@@ -274,7 +192,7 @@ void handle_command_mode(BYTE byteIn)
     speedsel_config = byteIn & SPEEDSEL_MASK;
     // Reset the bus:
 
-    bool presence = onewire_reset();
+    bool presence = onewire_reset(ONEWIRE_PIN);
     if(presence){
       Serial.write(0b11001100);
     }else{
@@ -314,7 +232,6 @@ void handle_command_mode(BYTE byteIn)
 
 void handle_check_mode(BYTE byteIn)
 {
-
   if (byteIn == 0xe3)
   {
       if(isSearchOn){
@@ -326,7 +243,6 @@ void handle_check_mode(BYTE byteIn)
   }
   else
   {
-    // Return a dummy response for other commands
     currentMode = COMMAND;
     handle_command_mode(byteIn);
   }
@@ -335,7 +251,7 @@ void handle_check_mode(BYTE byteIn)
 
 void sendByte(BYTE byteIn){
   DEBUGF("Sending byte in DATA mode: 0x%02X", byteIn);  
-      BYTE res = onewire_send_byte(byteIn);
+      BYTE res = onewire_send_byte(ONEWIRE_PIN, byteIn);
       DEBUGF("Received byte: 0x%02X", res);
       Serial.write(res); // Echo the response back
 }
@@ -356,16 +272,15 @@ void doSearch(BYTE byteIn){
       DEBUGF("0x%02X", searchIn[j]);
     }
 
-    onewire_reset();
-
-    onewire_send_byte(0xF0);
+    onewire_reset(ONEWIRE_PIN);
+    onewire_send_byte(ONEWIRE_PIN,0xF0);
 
     //onewire_send_byte(0xf0); //rom search
     // Process the search command
     for(int i = 0; i < 16; i++){
       for(int j = 0; j < 8; j+=2){
-        boolean b0 = onewire_send_bit(1);
-        boolean b1 = onewire_send_bit(1);
+        boolean b0 = onewire_send_bit(ONEWIRE_PIN,1);
+        boolean b1 = onewire_send_bit(ONEWIRE_PIN,1);
         boolean rn = (searchIn[i] >> (j+1)) & 0x1;
         boolean b2;
         boolean d;
@@ -377,7 +292,7 @@ void doSearch(BYTE byteIn){
           d=0;
           b2 = b0;
         }
-        onewire_send_bit(b2);
+        onewire_send_bit(ONEWIRE_PIN, b2);
 
         BYTE ret = d | (b2 << 1);
         searchOut[i] |= ret << j;
@@ -410,75 +325,18 @@ void handle_data_mode(BYTE byteIn)
 
 void setup()
 {
-
-  //pinMode(RX_PIN, INPUT);
-  
-
-  #ifndef DEBUG
-  // Wait for a break condition: line LOW for >12ms
-  //waitForBreak();
-  #endif
-
-  // Start serial after detecting break
+  // Start serial - ignore that a break is needed - seems to work without.
   Serial.begin(9600);
   while (!Serial); 
   DEBUGF("Serial started at 9600 baud");
   while(!Serial.available());
-
-
-}
-
-void debugLoop(){
-   
-  onewire_reset();
-  onewire_send_byte(0x33);
-  BYTE romInfo[8];
-  for(int i = 0; i < 8; i++){
-    romInfo[i] = onewire_send_byte(0xff);
-  }
-  DEBUGF("ROM Info:");
-  DEBUGF("Family Code: 0x%02X", romInfo[0]);
-  DEBUGF("Serial Number: 0x%02X%02X%02X%02X%02X%02X", romInfo[1], romInfo[2], romInfo[3], romInfo[4], romInfo[5], romInfo[6]);
-  DEBUGF("CRC: 0x%02X", romInfo[7]);
-
-  onewire_send_byte(0x44);
-  while(true){
-  delay(100);
-  bool done = onewire_send_bit(1);
-  if(done){
-    break;
-  }
-  }
-
-  onewire_reset();
-  onewire_send_byte(0x33);
-  for(int i = 0; i < 8; i++){
-    romInfo[i] = onewire_send_byte(0xff);
-  }
-  onewire_send_byte(0xbe);
-  
-  BYTE result[8];
-  for(int i = 0; i < 8; i++){
-    result[i] = onewire_send_byte(0xff);
-  }
-  DEBUGF("Temperature: %d.%d C", result[0], result[1]);
-
-
-  return;
 }
 void loop()
 {
 
   DEBUGF("Starting main loop");
-  #ifdef DEBUG
-  //debugLoop();
-  //return;
-  #endif
- 
- while (true)
-  {
-    while (!Serial.available())
-      ;
+
+    while (!Serial.available());
     byte byteIn;
     byteIn = Serial.read();
     DEBUGF("Received byte: 0x%02X. Current mode is %d", byteIn, currentMode);
@@ -494,30 +352,4 @@ void loop()
       handle_check_mode(byteIn);
       break;
     }
-  }
-}
-
-void waitForBreak()
-{
-  unsigned long lowStart = 0;
-
-  while (true)
-  {
-    if (digitalRead(RX_PIN) == LOW)
-    {
-      if (lowStart == 0)
-      {
-        lowStart = millis();
-      }
-      else if (millis() - lowStart > 12)
-      {
-        // Break detected (>12ms low)
-        return;
-      }
-    }
-    else
-    {
-      lowStart = 0; // Reset timer
-    }
-  }
 }
